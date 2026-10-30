@@ -195,6 +195,7 @@ function Policy.sale(items, options, level)
         local explicitly_unequipped = record.equipped == false
             or (item.kind == "ability" and type(record.equipped) == "table" and not item.equipped)
         if explicitly_unequipped and not item.equipped and not protected[item.kind .. ":" .. item.id]
+            and not (item.kind=="ability" and options.loadouts and (record.name==options.loadouts.q or record.name==options.loadouts.e))
             and not Policy.locked(item, options.locks) and options.sell_rarities[rarity] == true
             and (item.kind ~= "ability" or options.sell_abilities == true)
             and rarity ~= "legendary" and rarity ~= "ultimate" then
@@ -370,6 +371,98 @@ function Policy.aoe_hold(state, key, now, count, incoming, enabled)
     if now - row.since >= 0.65 then row.done = true; return false end
     return true
 end
+function Policy.select_dungeon(rows, level, preferences, offset, history)
+    preferences = preferences or {}
+    local rank = {Easy=1,Medium=2,Hard=3,Insane=4,Nightmare=5}
+    local eligible = {}
+    local allowed = preferences.allowed or {}
+    local restricted = next(allowed) ~= nil
+    for _, row in ipairs(rows) do
+        local difficulty = rank[row[3]]
+        if difficulty and type(row[1]) == "number" and row[1] <= level and row[1] >= 1
+            and (not restricted or allowed[row[2]] == true)
+            and difficulty >= (rank[preferences.minimum] or 1) and difficulty <= (rank[preferences.maximum] or 5) then
+            eligible[#eligible + 1] = row
+        end
+    end
+    table.sort(eligible,function(a,b) if a[1]~=b[1] then return a[1]<b[1] end
+        if a[2]~=b[2] then return a[2]<b[2] end return rank[a[3]]<rank[b[3]] end)
+    if #eligible == 0 then return nil, "No unlocked dungeon matches your filters; edit Dungeons settings" end
+    local mode = preferences.mode or "level"
+    local index = Policy.adaptive_index(#eligible, (offset or 0) - (mode == "reliable" and 1 or 0))
+    local chosen = eligible[index]
+    if mode == "xp" then
+        local best, rate
+        for i=1,index do
+            local row, clears, seconds, xp, failures, samples = eligible[i], 0, 0, 0, 0, 0
+            local tier = row[2] .. " / " .. row[3]
+            for h=#(history or {}),1,-1 do
+                local run=history[h]
+                if run.tier==tier then
+                    samples=samples+1; seconds=seconds+math.max(run.duration or 0,1)
+                    if run.result=="clear" then clears=clears+1; xp=xp+math.max(run.xp or 0,0) else failures=failures+1 end
+                    if samples>=6 then break end
+                end
+            end
+            if clears>=2 and xp>0 and seconds>0 then
+                local value=xp/seconds * clears/math.max(1,clears+failures)
+                if not rate or value>rate then best,rate=row,value end
+            end
+        end
+        if best then return best,"Observed XP/time among tiers with at least two clears; failures reduce ranking" end
+        return chosen,"XP history is insufficient; using highest eligible level tier with adaptive backoff"
+    end
+    return chosen,mode=="reliable" and "Reliable mode: one eligible tier below level maximum, plus failure backoff"
+        or "Highest level-eligible tier, adjusted by saved filters and failure backoff"
+end
+function Policy.loadout_plan(items, level, options, mode, locks)
+    options = options or {}
+    local candidates, current, used, plan = {}, {}, {}, {}
+    for _,item in ipairs(items) do
+        if item.kind=="ability" then
+            for _,slot in ipairs({"q","e"}) do
+                if type(item.record.equipped)=="table" and item.record.equipped[slot] then current[slot]=item end
+            end
+            if item.level<=level and item.ability and item.ability.role~="ignore" and not Policy.locked(item,locks) then
+                if item.ability.role=="physical" or item.ability.role=="buff" then candidates[#candidates+1]=item end
+            end
+        end
+    end
+    -- A protected or explicitly preferred slot is reserved before ranking either slot.
+    for _,slot in ipairs({"q","e"}) do
+        local preferred=options[slot]
+        if type(preferred)=="string" and preferred~="" then
+            plan[slot]=current[slot]
+            for _,item in ipairs(items) do
+                if item.kind=="ability" and item.level<=level and item.record.name==preferred then plan[slot]=item;break end
+            end
+            if plan[slot] then used[plan[slot]]=true end
+        elseif current[slot] and Policy.locked(current[slot],locks) then plan[slot]=current[slot];used[plan[slot]]=true end
+    end
+    for _,slot in ipairs({"q","e"}) do
+        if not (type(options[slot])=="string" and options[slot]~="") and not plan[slot] then
+            local best,score
+            for _,item in ipairs(candidates) do
+                if not used[item] then
+                    local meta=item.ability
+                    local other=slot=="q" and plan.e or plan.q
+                    local value=(meta.damage or 0)/math.max(meta.cooldown or 1,0.5)
+                    if meta.role=="buff" then
+                        local damage_available=false
+                        for _,candidate in ipairs(candidates) do if candidate~=item and candidate.ability.role=="physical" then damage_available=true end end
+                        value=damage_available and 100000 or -1
+                        if other and other.ability and other.ability.role=="buff" then value=-1 end
+                    elseif mode=="crowd" and (meta.radius or 0)>0 then value=value*2 end
+                    if value>=0 and (not score or value>score or (value==score and item.id<(best and best.id or math.huge))) then best,score=item,value end
+                end
+            end
+            plan[slot]=best or current[slot]
+            if plan[slot] then used[plan[slot]]=true end
+        end
+    end
+    return plan
+end
+
 -- END POLICY
 local features = {run_started = nil, outcome = nil, recovery = "Waiting for run", profile = "Balanced",
     inventory = "Gear / selling: current handlers required", telegraphs = "Telegraphs: no verified indicators",
@@ -379,6 +472,24 @@ local features = {run_started = nil, outcome = nil, recovery = "Waiting for run"
     upgrade_note = "Gold upgrades: waiting", signal_counts = {}}
 session.features = features
 features.adaptive, features.recent_cues = {offset = 0}, {}
+features.recorder, features.failed_routes = {}, {}
+if type(session.metrics.native_catalog)=="table" then
+    local cached={}
+    for _,row in ipairs(session.metrics.native_catalog) do
+        if type(row)=="table" and type(row[1])=="number" and row[1]>=1 and row[1]<1000000
+            and type(row[2])=="string" and #row[2]<100 and ({Easy=true,Medium=true,Hard=true,Insane=true,Nightmare=true})[row[3]] then
+            cached[#cached+1]=row
+            if #cached>=200 then break end
+        end
+    end
+    if #cached>0 then features.catalog=cached;features.catalog_note="Native requirements cached from previous lobby" end
+end
+session.options.dungeons = type(session.options.dungeons) == "table" and session.options.dungeons or {}
+session.options.loadouts = type(session.options.loadouts) == "table" and session.options.loadouts or {}
+session.options.presets = type(session.options.presets) == "table" and session.options.presets or {}
+session.options.auto_swing = session.options.auto_swing ~= false
+session.options.auto_loadout = session.options.auto_loadout ~= false
+session.options.compact_hud = session.options.compact_hud == true
 features.watchdog, features.aoe_wait = {}, setmetatable({}, {__mode = "k"})
 session.options.boss_profiles = type(session.options.boss_profiles) == "table" and session.options.boss_profiles or {}
 session.options.adaptive_dungeons = session.options.adaptive_dungeons ~= false
@@ -506,8 +617,8 @@ local function label(text, y, height)
     item.Text = text
     return item
 end
-features.ui_title = label("DQR Warrior auto v10", 8, 26)
-features.ui_title.Size = UDim2.new(1, -72, 0, 26)
+features.ui_title = label("DQR Warrior auto v10 R2", 8, 26)
+features.ui_title.Size = UDim2.new(1, -180, 0, 26)
 features.ui_title.Font = Enum.Font.GothamBold
 features.ui_state = label(session.enabled and "RUNNING  |  F8 pauses" or "PAUSED  |  F8 resumes", 36, 20)
 features.ui_state.TextColor3 = session.enabled and Color3.fromRGB(93, 216, 195) or Color3.fromRGB(255, 188, 90)
@@ -865,6 +976,63 @@ local progression = {
     {140, "Orbital Outpost", "Insane"}, {146, "Orbital Outpost", "Nightmare"},
     {150, "Volcanic Chambers", "Insane"}, {155, "Volcanic Chambers", "Nightmare"},
 }
+function features.refresh_catalog()
+    local level = features.level and features.level() or 0
+    if features.catalog and features.catalog_level == level then return features.catalog end
+    local rows, names = {}, {}
+    for _,row in ipairs(progression) do rows[#rows+1]=row; names[row[2]]=true end
+    local gui_root=player:FindFirstChildOfClass("PlayerGui")
+    local queue=gui_root and gui_root:FindFirstChild("queueGui")
+    local choose=queue and queue:FindFirstChild("chooseDungeon")
+    local left=choose and choose:FindFirstChild("backgroundFillLeft")
+    local list=left and left:FindFirstChild("ScrollingFrame")
+    if list then
+        for _,item in ipairs(list:GetChildren()) do
+            if item:IsA("GuiObject") and item.Visible and item:FindFirstChild("chosenIndicatorBackground") then names[item.Name]=true end
+        end
+    end
+    local availability
+    local utility=RS:FindFirstChild("Utility")
+    local module=utility and utility:FindFirstChild("MapPlaces")
+    if module and module:IsA("ModuleScript") then
+        local ok,value=pcall(require,module)
+        if ok and type(value)=="table" and type(value.IsAvailable)=="function" then availability=value.IsAvailable end
+    end
+    local remote=remotes:FindFirstChild("getDungeonStats")
+    local verified=0
+    if remote and remote:IsA("RemoteFunction") and features.rpc then
+        local ordered={};for name in pairs(names) do ordered[#ordered+1]=name end;table.sort(ordered)
+        for _,name in ipairs(ordered) do
+            if not session.alive or not session.enabled then return rows end
+            local available=true
+            if availability then local ok,value=pcall(availability,name); available=ok and value==true end
+            if not available then
+                for i=#rows,1,-1 do if rows[i][2]==name then table.remove(rows,i) end end
+            else
+                lobby_note="Reading native dungeon requirements: " .. name
+                local data=features.rpc(remote,name)
+                local native={}
+                if type(data)=="table" then
+                    for _,difficulty in ipairs({"Easy","Medium","Hard","Insane","Nightmare"}) do
+                        local info=data[difficulty]
+                        local required=type(info)=="table" and tonumber(info.levelReq)
+                        if required and required==required and required>=1 and required<1000000 then native[#native+1]={math.ceil(required),name,difficulty} end
+                    end
+                end
+                if #native>0 then
+                    for i=#rows,1,-1 do if rows[i][2]==name then table.remove(rows,i) end end
+                    for _,row in ipairs(native) do rows[#rows+1]=row end
+                    verified=verified+1
+                end
+            end
+        end
+    end
+    features.catalog,features.catalog_level=rows,level
+    session.metrics.native_catalog=rows
+    features.catalog_note=verified>0 and (verified .. " native dungeon definitions; bundled fallback for unavailable responses") or "bundled requirements; native definitions unavailable"
+    return rows
+end
+
 local function own_lobby()
     local games = workspace:FindFirstChild("games")
     local folder = games and games:FindFirstChild("inLobby")
@@ -877,7 +1045,7 @@ task.spawn(function()
         elseif session.enabled and lobby_place and not session.lobby_attempted and not session.lobby_busy then
             local stats = player:FindFirstChild("leaderstats")
             local level = stats and stats:FindFirstChild("Level")
-            if not level then
+            if not level or not tonumber(level.Value) or tonumber(level.Value) < 1 then
                 lobby_note = "Waiting for leaderstats.Level"
             else
                 session.lobby_attempted, session.lobby_busy = true, true
@@ -894,11 +1062,12 @@ task.spawn(function()
                         if not session.alive or not session.enabled then return end
                         assert(character_parts(), "Lobby character did not load")
                     end
-                    local unlocked = 1
-                    for index, row in ipairs(progression) do
-                        if level.Value >= row[1] then unlocked = index else break end
-                    end
-                    local chosen = progression[Policy.adaptive_index(unlocked, session.options.adaptive_dungeons ~= false and session.metrics.offset or 0)]
+                    local rows = features.refresh_catalog and features.refresh_catalog() or progression
+                    if not session.alive or not session.enabled then return end
+                    local chosen, why = Policy.select_dungeon(rows, tonumber(level.Value), session.options.dungeons,
+                        session.options.adaptive_dungeons ~= false and session.metrics.offset or 0, session.metrics.history or {})
+                    assert(chosen, why)
+                    features.selection_reason = why
                     local goal = Policy.goal(session.options, session.metrics, level.Value)
                     if goal then features.set_enabled(false, goal); return end
                     session.options.selection = {dungeon = chosen[2], difficulty = chosen[3]}
@@ -1173,6 +1342,12 @@ function features.inventory_preview()
     if not items then return "Waiting for an inventory snapshot" end
     for _, kind in ipairs({"weapon", "chest", "helmet"}) do
         local item = Policy.best_gear(items, features.level() or 0, session.options.locks)[kind]
+        local current
+        for _, candidate in ipairs(items) do if candidate.kind == kind and candidate.equipped then current = candidate; break end end
+        if item and not item.equipped then
+            lines[#lines + 1] = string.format("Change %s: physical %+.0f | health %+.0f", kind,
+                item.score - (current and current.score or 0), item.health - (current and current.health or 0))
+        end
         if item then lines[#lines + 1] = kind .. ": " .. tostring(item.record.name or item.id) .. " | physical " .. item.score
             .. (item.equipped and " | equipped" or (session.options.auto_equip and " | will equip: best usable physical stat" or " | auto-equip OFF")) end
     end
@@ -1193,6 +1368,158 @@ function features.inventory_preview()
     end
     return table.concat(lines, "\n")
 end
+function features.record_movement(root, direction, reason, navigation)
+    local now=os.clock()
+    if now-(features.last_record or -math.huge)<0.2 then return end
+    features.last_record=now
+    local p=root.Position
+    local row={at=now,position={x=p.X,y=p.Y,z=p.Z},command={x=direction.X,z=direction.Z},
+        target=target and target.Name or "none",reason=reason,blocked=features.movement_blocked==true,
+        recovery=features.recovery,path=path_note,waypoint=waypoint_index,stage=features.watchdog and features.watchdog.stage or 0,
+        wall=features.wall_sample and now-features.wall_sample.at<1 and features.wall_sample or nil}
+    features.recorder[#features.recorder+1]=row
+    while #features.recorder>80 do table.remove(features.recorder,1) end
+end
+function features.remember_route(position, direction, navigation)
+    direction=flat(direction)
+    if direction.Magnitude<0.05 then return end
+    local now=os.clock()
+    features.failed_routes=features.failed_routes or {}
+    for i=#features.failed_routes,1,-1 do
+        local row=features.failed_routes[i]
+        if now>row.expires or (row.position-position).Magnitude<2 and row.direction:Dot(direction.Unit)>0.8 then table.remove(features.failed_routes,i) end
+    end
+    features.failed_routes[#features.failed_routes+1]={position=position,direction=direction.Unit,expires=now+25}
+    while #features.failed_routes>24 do table.remove(features.failed_routes,1) end
+end
+function features.route_penalty(position, direction, now)
+    if direction.Magnitude<0.01 then return 0 end
+    local penalty=0
+    for i=#features.failed_routes,1,-1 do
+        local row=features.failed_routes[i]
+        if now>row.expires then table.remove(features.failed_routes,i)
+        elseif (row.position-position).Magnitude<5 then
+            penalty=math.max(penalty,math.max(0,row.direction:Dot(direction.Unit)-0.5)*30)
+        end
+    end
+    return penalty
+end
+function features.stuck_report()
+    local routes={}
+    for _,row in ipairs(features.failed_routes) do routes[#routes+1]={position={x=row.position.X,y=row.position.Y,z=row.position.Z},
+        direction={x=row.direction.X,z=row.direction.Z},remaining=math.max(0,row.expires-os.clock())} end
+    return Http:JSONEncode({version="v10 R2",place=game.PlaceId,enabled=session.enabled,level=features.level(),
+        movement=movement_note,path=path_note,recovery=features.recovery,samples=features.recorder,failed_routes=routes})
+end
+function features.classify_abilities(items)
+    local templates=RS:FindFirstChild("abilities")
+    for _,item in ipairs(items) do
+        if item.kind=="ability" then
+            local record=item.record
+            local template=templates and templates:FindFirstChild(tostring(record.name or ""))
+            local function native(name,fallback)
+                local value=template and template:FindFirstChild(name)
+                if value and (value:IsA("NumberValue") or value:IsA("IntValue") or value:IsA("StringValue")) then return value.Value end
+                return record[name] or fallback
+            end
+            local overrides=session.options.loadouts.roles or {}
+            local override=overrides[record.name]
+            local text=(tostring(native("abilityType","")) .. " " .. tostring(native("type","")) .. " " .. tostring(record.description or "")):lower()
+            local role=Policy.is_buff(tostring(record.name or ""),template and template:FindFirstChild("buffPower")~=nil) and "buff" or nil
+            if not role and (text:find("physical",1,true) or text:find("warrior",1,true)) then role="physical" end
+            if type(override)=="table" then role=override.role end
+            item.ability={role=role,damage=tonumber(native("damage",0)) or 0,cooldown=tonumber(native("cooldownLength",1)) or 1,
+                radius=type(override)=="table" and tonumber(override.radius) or tonumber(native("radius",0)) or 0}
+        end
+    end
+    return items
+end
+function features.loadout_mode()
+    if session.options.loadouts.mode=="boss" or session.options.loadouts.mode=="crowd" then return session.options.loadouts.mode end
+    for _,model in ipairs(enemies) do
+        if model:GetAttribute("IsBoss")==true or model.Name:lower():find("boss",1,true) then return "boss" end
+    end
+    return "crowd"
+end
+function features.apply_loadout(items)
+    if not session.enabled or features.loadout_blocked or features.restore_pending or features.trading() or os.clock()-(features.last_loadout or -math.huge)<10 then return items end
+    local character,_,root=character_parts()
+    local casting=character and character:FindFirstChild("busyCasting")
+    if casting and casting.Value then return items end
+    local started=workspace:FindFirstChild("dungeonStarted")
+    if not lobby_place and started and started.Value and not features.outcome then
+        if not root then return items end
+        for _,model in ipairs(enemies) do local part=enemy_root(model)
+            if part and (part.Position-root.Position).Magnitude<30 then features.loadout_note="Loadout waits until enemies are farther than 30 studs";return items end
+        end
+    end
+    features.last_loadout=os.clock()
+    items=features.classify_abilities(items)
+    local mode=features.loadout_mode()
+        local plan=Policy.loadout_plan(items,features.level() or 0,session.options.loadouts,mode,session.options.locks)
+    if plan.q and plan.q==plan.e then features.loadout_note="Preferred slots conflict; choose two different abilities"; return items end
+    local remote=remotes:FindFirstChild("equipItem")
+    if not remote or not remote:IsA("RemoteFunction") then return items end
+    for _,slot in ipairs({"q","e"}) do
+        local chosen=plan[slot]
+        if chosen and not (type(chosen.record.equipped)=="table" and chosen.record.equipped[slot]) then
+            if not session.enabled then return items end
+            local accepted,err=features.rpc(remote,"ability",chosen.id,slot)
+            assert(accepted,"Ability equip: " .. tostring(err or "rejected"))
+            local data,message=features.inventory_snapshot();assert(data,"Ability inventory refresh: " .. tostring(message))
+            items=features.observe_inventory(data)
+            local confirmed=false
+            for _,item in ipairs(items) do
+                if item.kind=="ability" and item.id==chosen.id and type(item.record.equipped)=="table" and item.record.equipped[slot] then confirmed=true end
+            end
+            assert(confirmed,"Ability slot update unconfirmed; stopping inventory pass")
+        end
+    end
+    features.loadout_note="Loadout " .. mode .. " | Q: " .. (plan.q and tostring(plan.q.record.name) or "unchanged")
+        .. " | E: " .. (plan.e and tostring(plan.e.record.name) or "unchanged")
+    return items
+end
+function features.preset(name, saving)
+    local keys={"profile","auto_replay","adaptive_dungeons","clear_target","dungeons","loadouts","auto_equip","auto_upgrade","gold_reserve",
+        "upgrade_budget","upgrade_ranking","auto_sell","sell_rarities","sell_abilities","locks","abilities","adaptive_spacing","smart_targets",
+        "ability_combos","aoe_priority","boss_corrections","boss_profiles","predictive_aim","aoe_wait","auto_loadout","auto_swing","compact_hud"}
+    local function copy(value)
+        if type(value)~="table" then return value end
+        local result={};for key,item in pairs(value) do result[key]=copy(item) end;return result
+    end
+    if saving then
+        local stored={spacing=config.spacing}
+        for _,key in ipairs(keys) do stored[key]=copy(session.options[key]) end
+        session.options.presets[name]=stored
+        save_state();return true
+    end
+    if features.inventory_busy or features.restore_pending or session.lobby_busy then features.recovery="Wait for current inventory / lobby request before applying a preset";return false end
+    local stored=session.options.presets[name]
+    local builtin=not stored
+    if not stored then
+        local defaults={Farming={profile="Balanced",dungeons={mode="reliable"},auto_replay=true,auto_swing=true},
+            Leveling={profile="Balanced",dungeons={mode="level"},auto_replay=true,auto_swing=true},
+            Boss={profile="Conservative",dungeons={mode="reliable"},loadouts={mode="boss"},auto_swing=true}}
+        stored=defaults[name]
+    end
+    if not stored then features.recovery="Save this preset first";return false end
+    for _,key in ipairs(keys) do
+        if stored[key]~=nil then
+            if builtin and type(stored[key])=="table" then
+                local merged=copy(session.options[key] or {})
+                for field,value in pairs(stored[key]) do merged[field]=copy(value) end
+                session.options[key]=merged
+            else session.options[key]=copy(stored[key]) end
+        end
+    end
+    if stored.spacing then config.spacing=math.clamp(stored.spacing,6,12);saved_state.spacing=config.spacing end
+    features.reset_steering,features.inventory_due=true,true
+    features.profile=session.options.profile;save_state()
+    if features.ensure_ui then features.ui_error="Preset refresh";features.ensure_ui() end
+    features.recovery="Preset applied: " .. name
+    return true
+end
+
 function features.inventory_pass()
     if features.inventory_busy then return end
     if features.trading and features.trading() then features.inventory = "Inventory waiting for trade to finish"; return end
@@ -1222,6 +1549,7 @@ function features.inventory_pass()
                 end
             end
         end
+        if session.enabled and session.options.auto_loadout and features.apply_loadout then items = features.apply_loadout(items) end
         if session.enabled and session.options.auto_upgrade then items = features.upgrade_gold(items) end
         if session.enabled and session.options.auto_sell then
             -- Re-fetch immediately before constructing a sale, after any equipment changes.
@@ -1256,7 +1584,13 @@ function features.inventory_pass()
         features.inventory = "Inventory: " .. #items .. " items; " .. (features.upgrade_note or "Warrior gear / locks applied")
     end)
     features.initial_inventory_done, features.inventory_busy = true, false
-    if not ok then features.inventory = "Inventory: " .. tostring(err) end
+    if not ok then
+        features.inventory = "Inventory: " .. tostring(err)
+        if tostring(err):find("Ability",1,true) then
+            features.loadout_blocked=true
+            features.loadout_note="Loadout update unconfirmed; use Retry ability loadouts after checking slots"
+        end
+    end
 end
 local inventory_update = remotes:FindFirstChild("updateLocalInventoryTable")
 if inventory_update and inventory_update:IsA("RemoteEvent") then
@@ -1351,7 +1685,18 @@ function features.combat_tick()
         trial.seconds = trial.seconds + 1
     end
     features.refresh_run()
+    if features.route_label then features.route_label.Text = "Movement samples: " .. #features.recorder .. " / 80 | Failed approaches: " .. #features.failed_routes
+        .. "\n" .. (features.recovery or "Ready") end
+    if features.dungeon_label then
+        local rows = features.catalog or progression
+        local chosen, why = Policy.select_dungeon(rows, features.level() or 0, session.options.dungeons,
+            session.options.adaptive_dungeons and session.metrics.offset or 0, session.metrics.history)
+        features.dungeon_label.Text = "Detected level: " .. tostring(features.level() or "loading") .. "\nNext: "
+            .. (chosen and chosen[2] .. " / " .. chosen[3] or "none eligible") .. "\n" .. why
+            .. "\nCatalogue: " .. (features.catalog_note or "bundled fallback")
+    end
     if features.preview_label then features.preview_label.Text = features.inventory_preview() end
+    if features.loadout_label then features.loadout_label.Text = features.loadout_note or "Loadout: waiting for classified physical abilities" end
     if features.boss_label then
         local cue = features.recent_cues[#features.recent_cues]
         features.boss_label.Text = "Enemy: " .. (target and target.Name or "none") .. "\nLatest cue: "
@@ -1463,6 +1808,11 @@ function features.finish(outcome)
         session.metrics.offset = previous_offset
     end
     features.progression_changed = previous_offset ~= session.metrics.offset
+    if Policy.select_dungeon and session.metrics.selected_tier then
+        local next_row=Policy.select_dungeon(features.catalog or progression,features.level() or 0,session.options.dungeons,
+            session.options.adaptive_dungeons and session.metrics.offset or 0,session.metrics.history)
+        if next_row and next_row[2] .. " / " .. next_row[3] ~= session.metrics.selected_tier then features.progression_changed=true end
+    end
     features.outcome = {kind = outcome, at = os.clock(), attempts = 0}
     features.inventory_due = true
     features.recovery = outcome == "clear" and "Clear recorded; collecting inventory" or "Failure recorded; preparing recovery"
@@ -1546,7 +1896,7 @@ function features.recover()
         features.recovery = "Native recovery confirmation dispatched"
         return
     end
-    local prefer_return = outcome.kind ~= "clear" or features.progression_changed or session.metrics.offset < 0
+    local prefer_return = outcome.kind ~= "clear" or features.progression_changed
     local command = prefer_return and "ReturnToLobbyEvent" or "replayDungeon"
     if not session.calls[command] then command = session.calls.replayDungeon and "replayDungeon" or command end
     if session.calls[command] then
@@ -1610,6 +1960,11 @@ function features.build_settings()
     panel.ZIndex = 20
     features.settings_panel = panel
     features.ui_style(panel, true)
+    local notice=Instance.new("TextLabel",panel)
+    notice.Name,notice.Position,notice.Size="SettingsNotice",UDim2.new(0,154,1,-34),UDim2.new(1,-168,0,26)
+    notice.ZIndex,notice.BackgroundTransparency,notice.TextColor3,notice.TextSize=22,1,Color3.fromRGB(93,216,195),12
+    notice.TextWrapped,notice.Text=true,"Settings save across servers | F8 pauses"
+    features.settings_notice=notice
     local close = Instance.new("TextButton", panel)
     close.Text, close.TextSize = "Close settings", 14
     close.ZIndex = 22
@@ -1631,7 +1986,7 @@ function features.build_settings()
         if not pages[name] then
             local page = Instance.new("ScrollingFrame", panel)
             page.Name = name .. "Page"
-            page.Position, page.Size = UDim2.fromOffset(152, 52), UDim2.new(1, -164, 1, -64)
+            page.Position, page.Size = UDim2.fromOffset(152, 52), UDim2.new(1, -164, 1, -102)
             page.BackgroundTransparency, page.ScrollBarThickness, page.BorderSizePixel = 1, 5, 0
             page.ZIndex, page.Active = 21, true
             page.ClipsDescendants = true
@@ -1651,7 +2006,7 @@ function features.build_settings()
         end
         heading.Text = "DQR / " .. name
     end
-    for index, name in ipairs({"Overview", "Combat", "Gear", "Goals", "History", "Diagnostics"}) do
+    for index, name in ipairs({"Overview", "Dungeons", "Combat", "Gear", "Presets", "Goals", "History", "Diagnostics"}) do
         local tab = Instance.new("TextButton", panel)
         tab.Name, tab.Text, tab.Font = name .. "Tab", name, Enum.Font.Gotham
         tab.Position, tab.Size = UDim2.fromOffset(12, 52 + (index - 1) * 44), UDim2.fromOffset(128, 36)
@@ -1667,6 +2022,7 @@ function features.build_settings()
         item.Position, item.Size = UDim2.fromOffset(8, y), UDim2.new(1, -24, 0, height or 28)
         item.BackgroundTransparency, item.TextColor3, item.TextSize = 1, Color3.new(1, 1, 1), 14
         item.TextWrapped, item.TextXAlignment, item.Text = true, Enum.TextXAlignment.Left, value
+        item.TextYAlignment = Enum.TextYAlignment.Top
         item.Font = Enum.Font.Gotham
         item.ZIndex = 22
         y = y + (height or 28) + 6
@@ -1692,7 +2048,13 @@ function features.build_settings()
         features.ui_style(item)
         item.ZIndex = 22
         item.BackgroundColor3, item.TextColor3 = Color3.fromRGB(44, 65, 87), Color3.new(1, 1, 1)
-        connections[#connections + 1] = item.Activated:Connect(function() callback(item) end)
+        connections[#connections + 1] = item.Activated:Connect(function()
+            local previous_notice=features.recovery
+            local ok,err=pcall(callback,item)
+            local message_bar=features.settings_notice or notice
+            message_bar.Text=ok and (features.recovery~=previous_notice and features.recovery or ("Updated: "..item.Text)) or ("Control error: "..tostring(err))
+            message_bar.TextColor3=ok and Color3.fromRGB(93,216,195) or Color3.fromRGB(255,188,90)
+        end)
         y = y + 40
         return item
     end
@@ -1705,6 +2067,10 @@ function features.build_settings()
     end
     features.dashboard = text("Collecting session metrics...", 160)
     features.feedback_label = text("Measuring health loss and spacing...", 156)
+    action("HUD: " .. (session.options.compact_hud and "COMPACT" or "DETAILED"), function(item)
+        session.options.compact_hud = not session.options.compact_hud
+        item.Text = "HUD: " .. (session.options.compact_hud and "COMPACT" or "DETAILED"); save_state()
+    end)
     action("Profile: " .. session.options.profile, function(item)
         local next_profile = {Aggressive = "Balanced", Balanced = "Conservative", Conservative = "Aggressive"}
         session.options.profile = next_profile[session.options.profile] or "Balanced"
@@ -1723,6 +2089,46 @@ function features.build_settings()
             features.recovery = "Recovery retry enabled"
         end
     end)
+    section("Dungeons")
+    text("LEVEL-AWARE DUNGEON QUEUE",32)
+    features.dungeon_label=text("Detecting level and reading native dungeon requirements...",130)
+    text("The lobby creates a private dungeon using your current level. Native requirements replace fallback entries when available. Existing lobbies are left intact.",65)
+    local dungeon_mode=entry("Selection mode: level, reliable, or xp",session.options.dungeons.mode or "level")
+    local allowed_names={}
+    for name,allowed in pairs(session.options.dungeons.allowed or {}) do if allowed then allowed_names[#allowed_names+1]=name end end
+    table.sort(allowed_names)
+    local allowed_input=entry("Allowed dungeons: comma-separated exact names; blank allows all",table.concat(allowed_names,", "))
+    local min_difficulty=entry("Minimum difficulty: Easy, Medium, Hard, Insane, Nightmare",session.options.dungeons.minimum or "Easy")
+    local max_difficulty=entry("Maximum difficulty",session.options.dungeons.maximum or "Nightmare")
+    action("Save dungeon preferences",function()
+        local mode=dungeon_mode.Text:lower():match("^%s*(.-)%s*$")
+        local valid={Easy=true,Medium=true,Hard=true,Insane=true,Nightmare=true}
+        local minimum=min_difficulty.Text:match("^%s*(.-)%s*$")
+        local maximum=max_difficulty.Text:match("^%s*(.-)%s*$")
+        if not ({level=true,reliable=true,xp=true})[mode] or not valid[minimum] or not valid[maximum] then features.recovery="Use a listed mode and difficulty";return end
+        local allowed={}
+        for name in allowed_input.Text:gmatch("[^,]+") do local clean=name:match("^%s*(.-)%s*$");if clean~="" then allowed[clean]=true end end
+        session.options.dungeons={mode=mode,allowed=allowed,minimum=minimum,maximum=maximum}
+        if not session.lobby_busy then session.lobby_attempted=false end
+        save_state();features.recovery="Dungeon preferences saved"
+    end)
+    action("Refresh native dungeon requirements / retry queue",function()
+        if session.lobby_busy then features.recovery="Wait for the active lobby request";return end
+        features.catalog_level=nil;session.lobby_attempted=false;features.recovery="Queue retry enabled"
+    end)
+    section("Presets")
+    text("SESSION PRESETS",32)
+    text("Save your current combat, dungeon, loadout and inventory settings. Applying a preset keeps your pause state and session counters. Unsaved Farming, Leveling and Boss presets provide starting settings.",80)
+    local preset_name=entry("Preset name", "Leveling")
+    action("Save current settings as preset",function()
+        local name=preset_name.Text:match("^%s*(.-)%s*$")
+        if name~="" and #name<=50 then features.preset(name,true);features.recovery="Preset saved: "..name end
+    end)
+    action("Apply named preset",function() features.preset(preset_name.Text:match("^%s*(.-)%s*$"),false) end)
+    for _,name in ipairs({"Farming","Leveling","Boss"}) do
+        action("Apply "..name.." preset",function() features.preset(name,false) end)
+    end
+
     section("Goals")
     option("Adaptive dungeon progression", "adaptive_dungeons")
     local clear_seconds = entry("Target clear time (seconds): 2 failures step down; 2 fast clears step up", session.options.clear_target)
@@ -1746,6 +2152,7 @@ function features.build_settings()
         features.recovery = "Goals saved"
     end)
     section("Combat")
+    option("Auto-swing at nearby enemies", "auto_swing")
     option("Predict enemy movement when aiming", "predictive_aim")
     option("Briefly hold AoE for approaching groups", "aoe_wait")
     features.boss_label = text("Waiting for boss / enemy attack cues", 150)
@@ -1805,6 +2212,37 @@ function features.build_settings()
         features.recovery = "No ability found in slot " .. slot:upper()
     end)
     section("Gear")
+    option("Automatic Warrior ability loadouts", "auto_loadout")
+    action("Loadout context: " .. (session.options.loadouts.mode or "auto"),function(item)
+        local next_mode={auto="crowd",crowd="boss",boss="auto"}
+        session.options.loadouts.mode=next_mode[session.options.loadouts.mode or "auto"] or "auto"
+        item.Text="Loadout context: "..session.options.loadouts.mode;features.inventory_due=true;save_state()
+    end)
+    text("Loadouts use owned abilities with explicit physical metadata or saved roles. Preferred slots are protected; unclassified abilities are not selected automatically. Changes wait for a quiet moment.", 80)
+    action("Retry ability loadouts",function()
+        features.loadout_blocked,features.last_loadout,features.inventory_due=false,nil,true
+        features.loadout_note="Loadout retry enabled"
+    end)
+    local ability_name = entry("Exact owned ability name", "")
+    local ability_role = entry("Ability role: physical, buff, ignore, or auto", "auto")
+    local ability_radius = entry("Known area radius for this ability; 0 = native radius / single target", 0)
+    action("Save ability role", function()
+        local name = ability_name.Text:match("^%s*(.-)%s*$")
+        local role = ability_role.Text:lower():match("^%s*(.-)%s*$")
+        if name ~= "" and ({physical=true,buff=true,ignore=true,auto=true})[role] then
+            session.options.loadouts.roles = session.options.loadouts.roles or {}
+            session.options.loadouts.roles[name] = role ~= "auto" and {role=role,radius=math.clamp(tonumber(ability_radius.Text) or 0,0,80)} or nil
+            features.inventory_due=true; save_state()
+        end
+    end)
+    local preferred_q = entry("Protected Q ability name; blank lets loadout choose", session.options.loadouts.q)
+    local preferred_e = entry("Protected E ability name; blank lets loadout choose", session.options.loadouts.e)
+    action("Save preferred ability slots", function()
+        session.options.loadouts.q=preferred_q.Text:match("^%s*(.-)%s*$")
+        session.options.loadouts.e=preferred_e.Text:match("^%s*(.-)%s*$")
+        features.inventory_due=true;save_state()
+    end)
+    features.loadout_label = text("Loadout: waiting for inventory", 70)
     features.preview_label = text("Waiting for inventory plan", 340)
     action("Refresh inventory preview", function() features.inventory_due = true end)
     action("Copy inventory preview", function()
@@ -1883,6 +2321,14 @@ function features.build_settings()
     section("Diagnostics")
     text("F8 always pauses. These controls preserve deliberate pauses and goals. A repeated-hit correction uses isolated learned timing, not every recent cue.", 70)
     for _, name in ipairs({"Copy enemy details", "Copy lobby, gear and attack handlers", "Reset session counters / goals", "Close and stop"}) do y = features.ui_adopt(name, scroll, y) end
+    features.route_label = text("Recording movement decisions...", 70)
+    action("Copy stuck report", function()
+        if type(setclipboard)=="function" then
+            local ok, err = pcall(function() setclipboard(features.stuck_report()) end)
+            features.recovery = ok and "Stuck report copied" or tostring(err)
+        end
+    end)
+    action("Clear failed-route memory", function() features.failed_routes = {}; features.reset_steering=true end)
     features.damage_label = text("No health losses recorded yet", 560)
     scroll.CanvasSize = UDim2.fromOffset(0, y + 12)
     features.show_page(session.options.ui_page or "Overview")
@@ -1893,7 +2339,9 @@ function features.build_settings()
     features.toggle_settings = function()
         if panel.Visible then panel.Visible = false else features.open_page(session.options.ui_page or "Overview") end
     end
+    if features.main_scale then features.main_scale:Destroy() end
     local main_scale, panel_scale = Instance.new("UIScale", frame), Instance.new("UIScale", panel)
+    features.main_scale=main_scale
     local camera = workspace.CurrentCamera
     if camera then
         local function resize()
@@ -1913,6 +2361,8 @@ function features.ensure_ui()
         return true
     end
     local connection_start = #connections
+    for _,connection in ipairs(features.settings_connections or {}) do connection:Disconnect() end
+    features.settings_connections={}
     local function salvage_controls()
         for _, control in pairs(features.toolbar or {}) do
             control.Parent, control.Visible = frame, true
@@ -1930,6 +2380,7 @@ function features.ensure_ui()
         note = "Settings failed: " .. tostring(err) .. "; click Repair settings"
         warn(note)
     else
+        for index=connection_start+1,#connections do features.settings_connections[#features.settings_connections+1]=connections[index] end
         note = session.enabled and "Settings ready; automation active" or "Settings ready; automation paused"
     end
     return ok
@@ -1937,7 +2388,8 @@ end
 -- Always available even if construction of a settings page fails.
 local repair_ui = Instance.new("TextButton", frame)
 repair_ui.Name, repair_ui.Text = "RepairSettings", "Repair settings"
-repair_ui.Position, repair_ui.Size = UDim2.fromOffset(306, 8), UDim2.fromOffset(140, 26)
+repair_ui.Position, repair_ui.Size = UDim2.fromOffset(332, 8), UDim2.fromOffset(70, 26)
+repair_ui.Text = "Repair"
 repair_ui.ZIndex, repair_ui.TextColor3, repair_ui.TextSize = 3, Color3.new(1, 1, 1), 12
 features.ui_style(repair_ui)
 connections[#connections + 1] = repair_ui.Activated:Connect(function() features.ensure_ui() end)
@@ -2527,6 +2979,7 @@ local function wall_heading(root, desired, normal, params, now)
             if risk <= math.max(0.4, pattern_risk(root.Position, now + 0.35)) then
                 local score = math.abs(candidate:Dot(tangent)) * 3 + candidate:Dot(normal) * 0.6
                     + candidate:Dot(desired) * 0.5 - risk * 100
+                if features.route_penalty then score = score - features.route_penalty(root.Position, candidate, now) end
                 if previous and previous.until_time > now then score = score + candidate:Dot(previous.direction) * 3 end
                 score = score + candidate:Dot(tangent) * (features.orbit_sign or 1) * 0.05
                 if not best_score or score > best_score then best, best_score = candidate, score end
@@ -2619,6 +3072,7 @@ local function tactical_direction(root, part, params, now)
                     end
                 end
             end
+            if features.route_penalty then score = score - features.route_penalty(root.Position, direction, now) end
             score = score + steering:Dot(direction) * 0.3
             if index == 48 then score = score + 0.15 end
             if not best_score or score > best_score then best, best_score = direction, score end
@@ -2643,6 +3097,47 @@ local function tactical_direction(root, part, params, now)
     if best and best:Dot(tangent) < -0.5 then features.orbit_sign = -(features.orbit_sign or 1) end
     if moving_choices == 0 then reason = "No safe movement direction: walls / ledges" end
     return best or Vector3.zero, reason
+end
+
+function features.auto_swing(character, root)
+    if not session.enabled or session.options.auto_swing==false or lobby_place or features.outcome or features.restore_pending
+        or pending_cast or os.clock()-last_swing<0.6 then return end
+    local peaceful=player:FindFirstChild("peaceful")
+    local started=workspace:FindFirstChild("dungeonStarted")
+    local busy=character:FindFirstChild("busyCasting")
+    if (peaceful and peaceful.Value) or not started or not started.Value or (busy and busy.Value) then return end
+    local limit=session.options.profile=="Conservative" and 0.4 or (session.options.profile=="Aggressive" and 0.8 or 0.6)
+    if pattern_risk(root.Position,os.clock()+0.25)>=limit or features.gaze_target() then return end
+    local safe=features.safe_part()
+    if safe then return end
+    local nearest,gap
+    for _,model in ipairs(enemies) do
+        local part=enemy_root(model)
+        if part and (not features.role or features.role(model)~="ignore") then
+            local distance=(part.Position-root.Position).Magnitude-body_radius(part)+1
+            if distance<=config.attack_range and (not gap or distance<gap) and clear_path(root,part.Position,ray_params(character)) then nearest,gap=part,distance end
+        end
+    end
+    if not nearest then features.swing_note="Melee: no enemy in range";return end
+    local offset=flat(nearest.Position-root.Position)
+    local facing=flat(root.CFrame.LookVector)
+    if offset.Magnitude>0.1 and facing.Magnitude>0.1 and facing.Unit:Dot(offset.Unit)<0.7 then
+        features.aim_point={position=nearest.Position,model=target,expires=os.clock()+0.15}
+        features.swing_note="Melee: facing nearby enemy";return
+    end
+    for _,item in ipairs(character:GetChildren()) do
+        if item:IsA("Accessory") and item:FindFirstChild("Weapon") then
+            local event=item:FindFirstChildOfClass("RemoteEvent")
+            local used=remotes:FindFirstChild("weaponUsed")
+            if event and used and used:IsA("RemoteEvent") then
+                last_swing=os.clock()
+                event:FireServer();used:FireServer()
+                session.metrics.swings=(session.metrics.swings or 0)+1
+                features.swing_note="Melee: swinging at nearby enemy";return
+            end
+        end
+    end
+    features.swing_note="Melee: waiting for equipped weapon"
 end
 
 local stat_arguments, stats_failed
@@ -2784,6 +3279,7 @@ task.spawn(function()
                 if not character then note = "Waiting for character"; return end
                 local peaceful = player:FindFirstChild("peaceful")
                 if peaceful and peaceful.Value then note = "Waiting for dungeon"; return end
+                features.auto_swing(character, root)
                 target = find_target(root)
                 local part = target and enemy_root(target)
                 if not part then
@@ -2882,27 +3378,16 @@ task.spawn(function()
                 end
                 ability_note = "Abilities: " .. decision
                 if danger >= danger_limit then return end
-                if distance <= config.attack_range and os.clock() - last_swing >= 0.6 then
-                    for _, item in ipairs(character:GetChildren()) do
-                        if item:IsA("Accessory") and item:FindFirstChild("Weapon") then
-                            local event = item:FindFirstChildOfClass("RemoteEvent")
-                            if event then
-                                last_swing = os.clock()
-                                event:FireServer()
-                                remotes.weaponUsed:FireServer()
-                                break
-                            end
-                        end
-                    end
-                end
             end)
             if not ok then note = "Combat error: " .. tostring(err) end
         end
         if session.alive then
             status.Text = features.ui_error and ("Settings error: " .. features.ui_error .. "\nClick Repair settings")
                 or session.exporting and "Exporting client controls..."
+                or session.options.compact_hud and ("Lv " .. tostring(features.level() or "?") .. " | " .. (session.metrics.selected_tier or "Selecting dungeon")
+                    .. "\nTarget: " .. (target and target.Name or "none") .. "\n" .. movement_note .. "\n" .. (features.swing_note or features.recovery))
                 or (note .. (lobby_place and "" or ("\n" .. movement_note .. "\n" .. ability_note))
-                .. "\n" .. learning_note .. "\n" .. stat_note)
+                .. "\n" .. learning_note .. "\n" .. stat_note .. "\n" .. (features.swing_note or "Melee: ready"))
         end
         task.wait(0.05)
     end
@@ -2996,6 +3481,7 @@ local function movement_frame(dt, fallback)
         local stage = Policy.watchdog(features.watchdog, os.clock(), root.Position,
             (planned.Magnitude > 0.05 or steering.Magnitude > 0.05 or features.movement_blocked) and not holding)
         if stage then
+            if features.remember_route then features.remember_route(root.Position, planned.Magnitude > 0.05 and planned or delta, navigation_key) end
             features.wall_route = nil
             session.metrics.recoveries = (session.metrics.recoveries or 0) + 1
             waypoints, path_target, last_path = nil, nil, 0
@@ -3050,6 +3536,11 @@ local function movement_frame(dt, fallback)
                     reason = "Approaching target"
                 end
             end
+            if not safe and direction.Magnitude>0.05 and features.route_penalty
+                and features.route_penalty(root.Position,direction,os.clock())>=5 then
+                local alternate=wall_heading(root,toward,-direction.Unit,params,os.clock())
+                if alternate then direction,reason=alternate,"Avoiding a recent failed approach" end
+            end
             if features.escape_until and os.clock() < features.escape_until and not safe then
                 local best, risk
                 for index = 0, 11 do
@@ -3061,6 +3552,7 @@ local function movement_frame(dt, fallback)
                     if clear_path(root, destination, params) and (not floor or workspace:Raycast(origin + candidate * 3, Vector3.new(0, -30, 0), params)) then
                         local danger = pattern_risk(destination, os.clock() + 0.35)
                         local score = danger * 100 + candidate:Dot(steering) * 2
+                            + (features.route_penalty and features.route_penalty(root.Position, candidate, os.clock()) or 0)
                         if not risk or score < risk then best, risk = candidate, score end
                     end
                 end
@@ -3077,6 +3569,7 @@ local function movement_frame(dt, fallback)
                 local heading = direction.Unit
                 local obstruction = workspace:Raycast(root.Position, heading * 3, params)
                 if obstruction then
+                    features.wall_sample={at=os.clock(),name=obstruction.Instance.Name,nx=obstruction.Normal.X,nz=obstruction.Normal.Z}
                     local slide = not safe and wall_heading(root, toward, obstruction.Normal, params, os.clock())
                     if slide then
                         direction, reason = slide, "Following wall: " .. obstruction.Instance.Name
@@ -3101,6 +3594,7 @@ local function movement_frame(dt, fallback)
             if reason == "No safe movement direction: walls / ledges" then features.movement_blocked = true end
             planned = direction
             movement_note = reason
+            if features.record_movement then features.record_movement(root, direction, reason, navigation_key) end
         end
         steering = steering:Lerp(planned, 1 - math.exp(-16 * dt))
         if steering.Magnitude > 1 then steering = steering.Unit end
